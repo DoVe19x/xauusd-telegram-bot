@@ -1,0 +1,21 @@
+# ─────────────────────────────────────────────────────────────
+#  render.yaml — Déploiement Render.com
+#  Type : Background Worker (tourne 24h/24 sans timeout)
+# ─────────────────────────────────────────────────────────────
+
+services:
+  - type: worker                          # Background Worker = pas de timeout HTTP
+    name: xauusd-signal-bot
+    runtime: python
+    plan: free                            # Plan gratuit Render
+
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+
+    envVars:
+      - key: TELEGRAM_TOKEN               # Saisis la valeur dans le dashboard Render
+        sync: false                       # sync:false = secret, pas dans le repo
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.0"
