@@ -1,8 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         XAUUSD SIGNAL BOT — Telegram + Render.com           ║
+║         XAUUSD SIGNAL BOT v3 — Twelve Data API              ║
 ║  Stratégie : EMA200 + RSI14 crossover 50 + ATR SL/TP        ║
-║  Timeframe  : 1H  |  Source : GC=F + fallback XAUUSD=X      ║
+║  Timeframe  : 1H  |  Paire : XAU/USD                        ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -14,7 +14,6 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import requests
-import yfinance as yf
 
 # ─────────────────────────────────────────────────────────────
 #  LOGGING
@@ -29,79 +28,96 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
+TWELVEDATA_KEY    = os.environ.get("TWELVEDATA_KEY", "")
 
-# On essaie plusieurs symboles dans l'ordre
-SYMBOLS         = ["GC=F", "XAUUSD=X", "GLD"]
-SYMBOL_DISPLAY  = "XAUUSD"
-TIMEFRAME       = "1h"
+SYMBOL_DISPLAY    = "XAUUSD"
+TWELVEDATA_SYMBOL = "XAU/USD"
+TIMEFRAME         = "1h"
+OUTPUT_SIZE       = 250        # bougies récupérées (max 5000 sur plan gratuit)
 
-EMA_PERIOD  = 200
-RSI_PERIOD  = 14
-ATR_PERIOD  = 14
-ATR_MULT_SL = 2.0
-RR_RATIO    = 2.0
+EMA_PERIOD        = 200
+RSI_PERIOD        = 14
+ATR_PERIOD        = 14
+ATR_MULT_SL       = 2.0
+RR_RATIO          = 2.0
 
-CHECK_INTERVAL_SEC  = 300
-DATA_PERIOD         = "30d"
-MIN_CANDLES         = EMA_PERIOD + RSI_PERIOD + 10
+CHECK_INTERVAL_SEC = 300       # scan toutes les 5 minutes
 
 # ─────────────────────────────────────────────────────────────
 #  VALIDATION
 # ─────────────────────────────────────────────────────────────
 def validate_config() -> bool:
+    ok = True
     if not TELEGRAM_TOKEN:
         log.error("❌ TELEGRAM_TOKEN manquant")
-        return False
+        ok = False
     if not TELEGRAM_CHAT_ID:
         log.error("❌ TELEGRAM_CHAT_ID manquant")
-        return False
-    log.info("✅ Configuration validée")
-    return True
+        ok = False
+    if not TWELVEDATA_KEY:
+        log.error("❌ TWELVEDATA_KEY manquant")
+        ok = False
+    if ok:
+        log.info("✅ Configuration validée")
+    return ok
 
 # ─────────────────────────────────────────────────────────────
-#  DONNÉES — essaie plusieurs symboles
+#  DONNÉES — Twelve Data API
 # ─────────────────────────────────────────────────────────────
 def fetch_ohlcv() -> pd.DataFrame:
     """
-    Essaie GC=F puis XAUUSD=X puis GLD.
-    Retourne le premier DataFrame valide.
+    Récupère les bougies 1H XAU/USD via Twelve Data.
+    Documentation : https://twelvedata.com/docs#time-series
     """
-    last_error = None
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol"      : TWELVEDATA_SYMBOL,
+        "interval"    : TIMEFRAME,
+        "outputsize"  : OUTPUT_SIZE,
+        "apikey"      : TWELVEDATA_KEY,
+        "format"      : "JSON",
+        "order"       : "ASC",   # du plus ancien au plus récent
+    }
 
-    for symbol in SYMBOLS:
-        try:
-            log.info(f"📡 Tentative téléchargement : {symbol}")
-            df = yf.download(
-                symbol,
-                period=DATA_PERIOD,
-                interval=TIMEFRAME,
-                auto_adjust=True,
-                progress=False,
-                threads=False,
-            )
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        raise ConnectionError(f"Erreur requête Twelve Data : {e}")
 
-            # Aplatir colonnes multi-index
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
+    # Vérification erreur API
+    if data.get("status") == "error":
+        raise ValueError(f"Twelve Data erreur : {data.get('message', 'inconnue')}")
 
-            df.dropna(inplace=True)
+    values = data.get("values")
+    if not values:
+        raise ValueError("Twelve Data : aucune donnée reçue")
 
-            if df.empty or len(df) < MIN_CANDLES:
-                log.warning(f"⚠️  {symbol} : données insuffisantes ({len(df)} bougies)")
-                continue
+    # Construction du DataFrame
+    df = pd.DataFrame(values)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df.set_index("datetime", inplace=True)
+    df = df.rename(columns={
+        "open"  : "Open",
+        "high"  : "High",
+        "low"   : "Low",
+        "close" : "Close",
+        "volume": "Volume",
+    })
+    for col in ["Open", "High", "Low", "Close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-            log.info(f"✅ {symbol} : {len(df)} bougies — clôture : {float(df['Close'].iloc[-1]):.2f}")
-            return df
+    df.dropna(inplace=True)
 
-        except Exception as e:
-            last_error = e
-            log.warning(f"⚠️  {symbol} échec : {e}")
-            time.sleep(5)  # petite pause entre chaque tentative
-            continue
+    min_required = EMA_PERIOD + RSI_PERIOD + 10
+    if len(df) < min_required:
+        raise ValueError(f"Données insuffisantes : {len(df)} bougies (minimum {min_required})")
 
-    raise ConnectionError(f"Tous les symboles ont échoué. Dernière erreur : {last_error}")
+    log.info(f"✅ {len(df)} bougies reçues — clôture : {float(df['Close'].iloc[-1]):.2f}")
+    return df
 
 # ─────────────────────────────────────────────────────────────
 #  INDICATEURS
@@ -152,34 +168,37 @@ def detect_signal(df: pd.DataFrame) -> dict | None:
     sl_dist = ATR_MULT_SL * atr
     tp_dist = sl_dist * RR_RATIO
 
-    log.info(f"📊 Prix: {price:.2f} | EMA200: {ema:.2f} | RSI: {rsi_now:.1f} (prev: {rsi_pre:.1f}) | ATR: {atr:.2f}")
+    log.info(
+        f"📊 Prix: {price:.2f} | EMA200: {ema:.2f} | "
+        f"RSI: {rsi_now:.1f} (prev: {rsi_pre:.1f}) | ATR: {atr:.2f}"
+    )
 
-    # LONG
+    # ── LONG ──────────────────────────────────────────────────
     if price > ema and rsi_pre < 50 and rsi_now >= 50:
         return {
             "direction": "LONG",
-            "price": round(price, 2),
-            "sl": round(price - sl_dist, 2),
-            "tp": round(price + tp_dist, 2),
-            "sl_dist": round(sl_dist, 2),
-            "tp_dist": round(tp_dist, 2),
-            "ema": round(ema, 2),
-            "rsi": round(rsi_now, 1),
-            "atr": round(atr, 2),
+            "price"    : round(price, 2),
+            "sl"       : round(price - sl_dist, 2),
+            "tp"       : round(price + tp_dist, 2),
+            "sl_dist"  : round(sl_dist, 2),
+            "tp_dist"  : round(tp_dist, 2),
+            "ema"      : round(ema, 2),
+            "rsi"      : round(rsi_now, 1),
+            "atr"      : round(atr, 2),
         }
 
-    # SHORT
+    # ── SHORT ─────────────────────────────────────────────────
     if price < ema and rsi_pre > 50 and rsi_now <= 50:
         return {
             "direction": "SHORT",
-            "price": round(price, 2),
-            "sl": round(price + sl_dist, 2),
-            "tp": round(price - tp_dist, 2),
-            "sl_dist": round(sl_dist, 2),
-            "tp_dist": round(tp_dist, 2),
-            "ema": round(ema, 2),
-            "rsi": round(rsi_now, 1),
-            "atr": round(atr, 2),
+            "price"    : round(price, 2),
+            "sl"       : round(price + sl_dist, 2),
+            "tp"       : round(price - tp_dist, 2),
+            "sl_dist"  : round(sl_dist, 2),
+            "tp_dist"  : round(tp_dist, 2),
+            "ema"      : round(ema, 2),
+            "rsi"      : round(rsi_now, 1),
+            "atr"      : round(atr, 2),
         }
 
     return None
@@ -188,10 +207,10 @@ def detect_signal(df: pd.DataFrame) -> dict | None:
 #  MESSAGES TELEGRAM
 # ─────────────────────────────────────────────────────────────
 def format_signal(sig: dict) -> str:
-    is_long  = sig["direction"] == "LONG"
-    emoji    = "🟢" if is_long else "🔴"
-    arrow    = "📈" if is_long else "📉"
-    now_utc  = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+    is_long = sig["direction"] == "LONG"
+    emoji   = "🟢" if is_long else "🔴"
+    arrow   = "📈" if is_long else "📉"
+    now_utc = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
 
     return (
         f"{emoji} *SIGNAL {sig['direction']} — {SYMBOL_DISPLAY}* {arrow}\n"
@@ -212,10 +231,11 @@ def format_signal(sig: dict) -> str:
 def format_startup() -> str:
     now_utc = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
     return (
-        f"🤖 *Bot XAUUSD démarré\\!*\n\n"
+        f"🤖 *Bot XAUUSD v3 démarré\\!*\n\n"
         f"⏰ `{now_utc}`\n\n"
         f"📋 *Config :*\n"
         f"   • Paire : `{SYMBOL_DISPLAY}` \\| TF : `1H`\n"
+        f"   • Source : `Twelve Data API`\n"
         f"   • EMA : `{EMA_PERIOD}` \\| RSI : `{RSI_PERIOD}` \\(niveau 50\\)\n"
         f"   • SL : `{ATR_MULT_SL}× ATR{ATR_PERIOD}` \\| R/R : `1:{RR_RATIO}`\n"
         f"   • Scan : toutes les `5 min`\n\n"
@@ -244,7 +264,7 @@ def send_telegram(text: str) -> bool:
 # ─────────────────────────────────────────────────────────────
 def main():
     log.info("=" * 60)
-    log.info("  XAUUSD Signal Bot — démarrage")
+    log.info("  XAUUSD Signal Bot v3 — Twelve Data")
     log.info("=" * 60)
 
     if not validate_config():
@@ -254,7 +274,6 @@ def main():
     send_telegram(format_startup())
 
     last_signal_direction: str | None = None
-    error_count: int = 0
 
     log.info(f"🔄 Scan toutes les {CHECK_INTERVAL_SEC}s")
 
@@ -263,7 +282,6 @@ def main():
             df     = fetch_ohlcv()
             df     = add_indicators(df)
             signal = detect_signal(df)
-            error_count = 0  # reset si succès
 
             if signal is None:
                 log.info("🔍 Pas de signal — conditions non réunies")
@@ -272,18 +290,15 @@ def main():
                 log.info(f"⏭  Signal {signal['direction']} ignoré — doublon")
 
             else:
-                log.info(f"🚨 SIGNAL : {signal['direction']} @ {signal['price']} | SL {signal['sl']} | TP {signal['tp']}")
+                log.info(
+                    f"🚨 SIGNAL : {signal['direction']} @ {signal['price']} "
+                    f"| SL {signal['sl']} | TP {signal['tp']}"
+                )
                 if send_telegram(format_signal(signal)):
                     last_signal_direction = signal["direction"]
 
-        except ConnectionError as e:
-            error_count += 1
-            log.warning(f"⚠️  Erreur données ({error_count}) : {e}")
-            # Pas de message Telegram pour les erreurs de données — pas de spam
-
         except Exception as e:
-            error_count += 1
-            log.error(f"💥 Erreur inattendue ({error_count}) : {e}")
+            log.warning(f"⚠️  Erreur : {e}")
 
         log.info(f"⏳ Prochain scan dans {CHECK_INTERVAL_SEC}s...")
         time.sleep(CHECK_INTERVAL_SEC)
