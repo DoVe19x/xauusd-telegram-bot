@@ -1,14 +1,4 @@
-# ─────────────────────────────────────────
-#  XAUUSD Signal Bot — dépendances Python
-#  Versions épinglées pour reproductibilité
-# ─────────────────────────────────────────
-
-# Données de marché
-yfinance==0.2.54
-
-# Calcul numérique
+# XAUUSD Signal Bot v3 — Twelve Data
 pandas==2.2.3
 numpy==1.26.4
-
-# Requêtes HTTP (Telegram API)
 requests==2.32.3
