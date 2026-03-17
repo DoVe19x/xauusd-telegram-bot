@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         XAUUSD SIGNAL BOT v3 — Twelve Data API              ║
-║  Stratégie : EMA200 + RSI14 crossover 50 + ATR SL/TP        ║
+║         XAUUSD SIGNAL BOT v4 — Twelve Data API              ║
+║  Stratégie : EMA200 + RSI14 crossover 45/55 + ATR SL/TP     ║
 ║  Timeframe  : 1H  |  Paire : XAU/USD                        ║
 ╚══════════════════════════════════════════════════════════════╝
 """
@@ -35,7 +35,7 @@ TWELVEDATA_KEY    = os.environ.get("TWELVEDATA_KEY", "")
 SYMBOL_DISPLAY    = "XAUUSD"
 TWELVEDATA_SYMBOL = "XAU/USD"
 TIMEFRAME         = "1h"
-OUTPUT_SIZE       = 250        # bougies récupérées (max 5000 sur plan gratuit)
+OUTPUT_SIZE       = 250
 
 EMA_PERIOD        = 200
 RSI_PERIOD        = 14
@@ -43,7 +43,11 @@ ATR_PERIOD        = 14
 ATR_MULT_SL       = 2.0
 RR_RATIO          = 2.0
 
-CHECK_INTERVAL_SEC = 300       # scan toutes les 5 minutes
+# ── Niveaux RSI ──────────────────────────────────────────────
+RSI_LONG_LEVEL    = 45   # LONG  : RSI croise AU-DESSUS de 45
+RSI_SHORT_LEVEL   = 55   # SHORT : RSI croise EN-DESSOUS de 55
+
+CHECK_INTERVAL_SEC = 300
 
 # ─────────────────────────────────────────────────────────────
 #  VALIDATION
@@ -51,76 +55,59 @@ CHECK_INTERVAL_SEC = 300       # scan toutes les 5 minutes
 def validate_config() -> bool:
     ok = True
     if not TELEGRAM_TOKEN:
-        log.error("❌ TELEGRAM_TOKEN manquant")
-        ok = False
+        log.error("❌ TELEGRAM_TOKEN manquant"); ok = False
     if not TELEGRAM_CHAT_ID:
-        log.error("❌ TELEGRAM_CHAT_ID manquant")
-        ok = False
+        log.error("❌ TELEGRAM_CHAT_ID manquant"); ok = False
     if not TWELVEDATA_KEY:
-        log.error("❌ TWELVEDATA_KEY manquant")
-        ok = False
+        log.error("❌ TWELVEDATA_KEY manquant"); ok = False
     if ok:
         log.info("✅ Configuration validée")
     return ok
 
 # ─────────────────────────────────────────────────────────────
-#  DONNÉES — Twelve Data API
+#  DONNÉES — Twelve Data
 # ─────────────────────────────────────────────────────────────
 def fetch_ohlcv() -> pd.DataFrame:
-    """
-    Récupère les bougies 1H XAU/USD via Twelve Data.
-    Documentation : https://twelvedata.com/docs#time-series
-    """
     url = "https://api.twelvedata.com/time_series"
     params = {
-        "symbol"      : TWELVEDATA_SYMBOL,
-        "interval"    : TIMEFRAME,
-        "outputsize"  : OUTPUT_SIZE,
-        "apikey"      : TWELVEDATA_KEY,
-        "format"      : "JSON",
-        "order"       : "ASC",   # du plus ancien au plus récent
+        "symbol"     : TWELVEDATA_SYMBOL,
+        "interval"   : TIMEFRAME,
+        "outputsize" : OUTPUT_SIZE,
+        "apikey"     : TWELVEDATA_KEY,
+        "format"     : "JSON",
+        "order"      : "ASC",
     }
-
     try:
         r = requests.get(url, params=params, timeout=15)
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        raise ConnectionError(f"Erreur requête Twelve Data : {e}")
+        raise ConnectionError(f"Erreur Twelve Data : {e}")
 
-    # Vérification erreur API
     if data.get("status") == "error":
-        raise ValueError(f"Twelve Data erreur : {data.get('message', 'inconnue')}")
+        raise ValueError(f"Twelve Data : {data.get('message', 'erreur inconnue')}")
 
     values = data.get("values")
     if not values:
         raise ValueError("Twelve Data : aucune donnée reçue")
 
-    # Construction du DataFrame
     df = pd.DataFrame(values)
     df["datetime"] = pd.to_datetime(df["datetime"])
-    df.set_index("datetime", inplace=True)
-    df = df.rename(columns={
-        "open"  : "Open",
-        "high"  : "High",
-        "low"   : "Low",
-        "close" : "Close",
-        "volume": "Volume",
-    })
-    for col in ["Open", "High", "Low", "Close"]:
+    df = df.set_index("datetime")
+    df = df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
+    for col in ["Open","High","Low","Close"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna()
 
-    df.dropna(inplace=True)
+    min_req = EMA_PERIOD + RSI_PERIOD + 10
+    if len(df) < min_req:
+        raise ValueError(f"Données insuffisantes : {len(df)} bougies")
 
-    min_required = EMA_PERIOD + RSI_PERIOD + 10
-    if len(df) < min_required:
-        raise ValueError(f"Données insuffisantes : {len(df)} bougies (minimum {min_required})")
-
-    log.info(f"✅ {len(df)} bougies reçues — clôture : {float(df['Close'].iloc[-1]):.2f}")
+    log.info(f"✅ {len(df)} bougies — clôture : {float(df['Close'].iloc[-1]):.2f}")
     return df
 
 # ─────────────────────────────────────────────────────────────
-#  INDICATEURS
+#  INDICATEURS  (pandas 3.0 compatible — pas de ChainedAssignment)
 # ─────────────────────────────────────────────────────────────
 def compute_ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
@@ -146,14 +133,15 @@ def compute_atr(df: pd.DataFrame, period: int) -> pd.Series:
     return tr.ewm(com=period - 1, adjust=False).mean()
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["ema200"] = compute_ema(df["Close"], EMA_PERIOD)
-    df["rsi14"]  = compute_rsi(df["Close"], RSI_PERIOD)
-    df["atr14"]  = compute_atr(df, ATR_PERIOD)
-    return df
+    # Utilise pd.assign pour éviter ChainedAssignmentWarning
+    return df.assign(
+        ema200 = compute_ema(df["Close"], EMA_PERIOD),
+        rsi14  = compute_rsi(df["Close"], RSI_PERIOD),
+        atr14  = compute_atr(df, ATR_PERIOD),
+    )
 
 # ─────────────────────────────────────────────────────────────
-#  DÉTECTION DU SIGNAL
+#  DÉTECTION DU SIGNAL — RSI 45/55
 # ─────────────────────────────────────────────────────────────
 def detect_signal(df: pd.DataFrame) -> dict | None:
     last = df.iloc[-1]
@@ -170,35 +158,38 @@ def detect_signal(df: pd.DataFrame) -> dict | None:
 
     log.info(
         f"📊 Prix: {price:.2f} | EMA200: {ema:.2f} | "
-        f"RSI: {rsi_now:.1f} (prev: {rsi_pre:.1f}) | ATR: {atr:.2f}"
+        f"RSI: {rsi_now:.1f} (prev: {rsi_pre:.1f}) | ATR: {atr:.2f} | "
+        f"Trend: {'▲ BULL' if price > ema else '▼ BEAR'}"
     )
 
-    # ── LONG ──────────────────────────────────────────────────
-    if price > ema and rsi_pre < 50 and rsi_now >= 50:
+    # ── LONG : prix > EMA200 ET RSI croise AU-DESSUS de 45 ───
+    if price > ema and rsi_pre < RSI_LONG_LEVEL and rsi_now >= RSI_LONG_LEVEL:
         return {
-            "direction": "LONG",
-            "price"    : round(price, 2),
-            "sl"       : round(price - sl_dist, 2),
-            "tp"       : round(price + tp_dist, 2),
-            "sl_dist"  : round(sl_dist, 2),
-            "tp_dist"  : round(tp_dist, 2),
-            "ema"      : round(ema, 2),
-            "rsi"      : round(rsi_now, 1),
-            "atr"      : round(atr, 2),
+            "direction" : "LONG",
+            "price"     : round(price, 2),
+            "sl"        : round(price - sl_dist, 2),
+            "tp"        : round(price + tp_dist, 2),
+            "sl_dist"   : round(sl_dist, 2),
+            "tp_dist"   : round(tp_dist, 2),
+            "ema"       : round(ema, 2),
+            "rsi"       : round(rsi_now, 1),
+            "atr"       : round(atr, 2),
+            "rsi_level" : RSI_LONG_LEVEL,
         }
 
-    # ── SHORT ─────────────────────────────────────────────────
-    if price < ema and rsi_pre > 50 and rsi_now <= 50:
+    # ── SHORT : prix < EMA200 ET RSI croise EN-DESSOUS de 55 ─
+    if price < ema and rsi_pre > RSI_SHORT_LEVEL and rsi_now <= RSI_SHORT_LEVEL:
         return {
-            "direction": "SHORT",
-            "price"    : round(price, 2),
-            "sl"       : round(price + sl_dist, 2),
-            "tp"       : round(price - tp_dist, 2),
-            "sl_dist"  : round(sl_dist, 2),
-            "tp_dist"  : round(tp_dist, 2),
-            "ema"      : round(ema, 2),
-            "rsi"      : round(rsi_now, 1),
-            "atr"      : round(atr, 2),
+            "direction" : "SHORT",
+            "price"     : round(price, 2),
+            "sl"        : round(price + sl_dist, 2),
+            "tp"        : round(price - tp_dist, 2),
+            "sl_dist"   : round(sl_dist, 2),
+            "tp_dist"   : round(tp_dist, 2),
+            "ema"       : round(ema, 2),
+            "rsi"       : round(rsi_now, 1),
+            "atr"       : round(atr, 2),
+            "rsi_level" : RSI_SHORT_LEVEL,
         }
 
     return None
@@ -223,20 +214,22 @@ def format_signal(sig: dict) -> str:
         f"⚖️ *R/R :* `1:{RR_RATIO}`  \\|  *SL :* `{ATR_MULT_SL}× ATR`\n"
         f"`{'─' * 32}`\n"
         f"📊 *EMA200 :* `{sig['ema']:,.2f}`  \\|  *RSI14 :* `{sig['rsi']}`  \\|  *ATR :* `{sig['atr']:,.2f}`\n"
+        f"🎯 *Niveau RSI déclenché :* `{sig['rsi_level']}`\n"
         f"`{'─' * 32}`\n"
-        f"_Stratégie : EMA200 \\+ RSI14 croisement 50 — 1H_\n"
+        f"_Stratégie : EMA200 \\+ RSI14 croisement {sig['rsi_level']} — 1H_\n"
         f"⚠️ _Gérez votre risque\\. Pas un conseil financier\\._"
     )
 
 def format_startup() -> str:
     now_utc = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
     return (
-        f"🤖 *Bot XAUUSD v3 démarré\\!*\n\n"
+        f"🤖 *Bot XAUUSD v4 démarré\\!*\n\n"
         f"⏰ `{now_utc}`\n\n"
         f"📋 *Config :*\n"
         f"   • Paire : `{SYMBOL_DISPLAY}` \\| TF : `1H`\n"
         f"   • Source : `Twelve Data API`\n"
-        f"   • EMA : `{EMA_PERIOD}` \\| RSI : `{RSI_PERIOD}` \\(niveau 50\\)\n"
+        f"   • EMA : `{EMA_PERIOD}`\n"
+        f"   • RSI LONG : croise `{RSI_LONG_LEVEL}` \\| SHORT : croise `{RSI_SHORT_LEVEL}`\n"
         f"   • SL : `{ATR_MULT_SL}× ATR{ATR_PERIOD}` \\| R/R : `1:{RR_RATIO}`\n"
         f"   • Scan : toutes les `5 min`\n\n"
         f"_En attente de signaux\\.\\.\\._"
@@ -264,7 +257,7 @@ def send_telegram(text: str) -> bool:
 # ─────────────────────────────────────────────────────────────
 def main():
     log.info("=" * 60)
-    log.info("  XAUUSD Signal Bot v3 — Twelve Data")
+    log.info(f"  XAUUSD Signal Bot v4 — RSI {RSI_LONG_LEVEL}/{RSI_SHORT_LEVEL}")
     log.info("=" * 60)
 
     if not validate_config():
@@ -285,13 +278,11 @@ def main():
 
             if signal is None:
                 log.info("🔍 Pas de signal — conditions non réunies")
-
             elif signal["direction"] == last_signal_direction:
-                log.info(f"⏭  Signal {signal['direction']} ignoré — doublon")
-
+                log.info(f"⏭  Doublon {signal['direction']} ignoré")
             else:
                 log.info(
-                    f"🚨 SIGNAL : {signal['direction']} @ {signal['price']} "
+                    f"🚨 SIGNAL {signal['direction']} @ {signal['price']} "
                     f"| SL {signal['sl']} | TP {signal['tp']}"
                 )
                 if send_telegram(format_signal(signal)):
